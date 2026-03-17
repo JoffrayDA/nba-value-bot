@@ -1,210 +1,147 @@
 """
-nba_fetcher.py
---------------
-Récupère les données de matchs NBA via l'API officielle (gratuit, sans clé).
-Fournit : pace, offensive/defensive rating, forme récente des équipes.
+odds_fetcher.py
+---------------
+Récupère les cotes NBA en temps réel via la librairie ps3838api.
+Authentification : username + password Asian Connect via variables d'env.
+
+pip install ps3838api
 """
 
-import pandas as pd
-import time
-from nba_api.stats.endpoints import (
-    leaguegamefinder,
-    teamdashboardbygeneralsplits,
-    leaguedashteamstats,
-)
-from nba_api.stats.static import teams as nba_teams_static
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
-# ── Constantes ──────────────────────────────────────────────────────────────
-CURRENT_SEASON = "2024-25"
-RECENT_GAMES   = 10          # nb de matchs pour calculer la "forme" d'une équipe
-API_DELAY      = 0.6         # secondes entre chaque appel (évite le rate-limit NBA)
+from ps3838api.api.client import PinnacleClient
+from datetime import datetime
+
+client = PinnacleClient()
+
+SPORT_ID   = 4    # Basketball
+LEAGUE_NBA = 487  # NBA
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+def odd_to_prob(odd: float) -> float:
+    return round(1 / odd, 4) if odd > 1 else 0.0
 
-def get_all_teams() -> dict:
-    """Retourne un dict {nom_equipe: team_id} pour toutes les équipes NBA."""
-    teams = nba_teams_static.get_teams()
-    return {t["full_name"]: t["id"] for t in teams}
-
-
-def get_team_id(team_name: str) -> int | None:
-    """Trouve l'ID d'une équipe depuis son nom (partiel ou complet)."""
-    all_teams = get_all_teams()
-    for name, tid in all_teams.items():
-        if team_name.lower() in name.lower():
-            return tid
-    return None
+def prob_to_odd(prob: float) -> float:
+    return round(1 / prob, 2) if prob > 0 else 0.0
 
 
-# ── Statistiques avancées de la ligue ────────────────────────────────────────
+def get_nba_fixtures() -> list[dict]:
+    print("[PS3838] Récupération des fixtures NBA...")
+    try:
+        resp = client.get_fixtures(sport_id=SPORT_ID, league_ids=[LEAGUE_NBA])
+    except Exception as e:
+        print(f"[PS3838] Erreur fixtures : {e}")
+        return []
 
-def get_league_advanced_stats(season: str = CURRENT_SEASON) -> pd.DataFrame:
-    """
-    Récupère les stats avancées de toutes les équipes NBA pour la saison.
-    Colonnes clés : TEAM_NAME, PACE, OFF_RATING, DEF_RATING, NET_RATING, W_PCT
-    """
-    print(f"[NBA] Chargement des stats avancées ({season})...")
-    time.sleep(API_DELAY)
+    fixtures = []
+    for league in resp.get("league", []):
+        for event in league.get("events", []):
+            if event.get("liveStatus", 0) == 1:
+                continue
+            if event.get("status", "O") != "O":
+                continue
+            starts = event.get("starts", "")
+            try:
+                dt       = datetime.fromisoformat(starts.replace("Z", "+00:00"))
+                date_str = dt.strftime("%d/%m %H:%M")
+            except Exception:
+                date_str = starts
+            fixtures.append({
+                "event_id":  event["id"],
+                "home_team": event.get("home", ""),
+                "away_team": event.get("away", ""),
+                "starts":    starts,
+                "date":      date_str,
+            })
 
-    stats = leaguedashteamstats.LeagueDashTeamStats(
-        season=season,
-        measure_type_detailed_defense="Advanced",
-    )
-    df = stats.get_data_frames()[0]
-
-    # Colonnes utiles pour notre modèle
-    cols = [
-        "TEAM_ID", "TEAM_NAME",
-        "W", "L", "W_PCT",
-        "PACE", "OFF_RATING", "DEF_RATING", "NET_RATING",
-        "EFG_PCT", "TS_PCT",
-    ]
-    # Garde seulement les colonnes qui existent
-    available = [c for c in cols if c in df.columns]
-    df = df[available].copy()
-
-    print(f"[NBA] {len(df)} équipes chargées.")
-    return df
+    print(f"[PS3838] {len(fixtures)} matchs NBA trouvés")
+    return fixtures
 
 
-# ── Forme récente d'une équipe ────────────────────────────────────────────────
-
-def get_team_recent_form(team_id: int, n_games: int = RECENT_GAMES) -> dict:
-    """
-    Calcule la forme récente d'une équipe sur ses n derniers matchs.
-    Retourne : pts_for_avg, pts_against_avg, win_rate_recent, total_avg
-    """
-    time.sleep(API_DELAY)
-
-    finder = leaguegamefinder.LeagueGameFinder(
-        team_id_nullable=team_id,
-        season_nullable=CURRENT_SEASON,
-        season_type_nullable="Regular Season",
-    )
-    df = finder.get_data_frames()[0]
-
-    if df.empty:
+def get_nba_odds_raw() -> dict:
+    print("[PS3838] Récupération des cotes NBA...")
+    try:
+        return client.get_odds(sport_id=SPORT_ID, league_ids=[LEAGUE_NBA])
+    except Exception as e:
+        print(f"[PS3838] Erreur cotes : {e}")
         return {}
 
-    # Trier par date décroissante, prendre les n derniers
-    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
-    df = df.sort_values("GAME_DATE", ascending=False).head(n_games)
 
-    # Identifier les matchs à domicile/extérieur
-    df["IS_HOME"] = ~df["MATCHUP"].str.contains("@")
-    df["WON"]     = df["WL"] == "W"
+def parse_totals(fixtures: list[dict], odds_data: dict) -> list[dict]:
+    fixture_map = {f["event_id"]: f for f in fixtures}
+    results     = []
 
-    return {
-        "team_id":          team_id,
-        "games_analyzed":   len(df),
-        "pts_for_avg":      round(df["PTS"].mean(), 1),
-        "pts_against_avg":  round((df["PTS"] - df["PLUS_MINUS"]).mean(), 1),  # PTS adversaire
-        "plus_minus_avg":   round(df["PLUS_MINUS"].mean(), 1),
-        "win_rate_recent":  round(df["WON"].mean(), 3),
-        "total_avg":        round(df["PTS"].mean() + (df["PTS"] - df["PLUS_MINUS"]).mean(), 1),
-        "home_pts_avg":     round(df[df["IS_HOME"]]["PTS"].mean(), 1) if df["IS_HOME"].any() else None,
-        "away_pts_avg":     round(df[~df["IS_HOME"]]["PTS"].mean(), 1) if (~df["IS_HOME"]).any() else None,
-    }
+    for league in odds_data.get("leagues", []):
+        for event in league.get("events", []):
+            event_id = event["id"]
+            fixture  = fixture_map.get(event_id)
+            if not fixture:
+                continue
+            for period in event.get("periods", []):
+                if period.get("number") != 0:
+                    continue
+                if period.get("status") != 1:
+                    continue
+                totals = period.get("totals", [])
+                if not totals:
+                    continue
+                main_total = next(
+                    (t for t in totals if not t.get("altLineId")),
+                    totals[0]
+                )
+                line      = main_total.get("points", 0)
+                over_odd  = main_total.get("over", 0)
+                under_odd = main_total.get("under", 0)
+                if not line or not over_odd or not under_odd:
+                    continue
+                results.append({
+                    "event_id":     event_id,
+                    "home_team":    fixture["home_team"],
+                    "away_team":    fixture["away_team"],
+                    "date":         fixture["date"],
+                    "total_line":   line,
+                    "best_over":    {"bookmaker": "PS3838", "point": line, "price": over_odd},
+                    "best_under":   {"bookmaker": "PS3838", "point": line, "price": under_odd},
+                    "n_bookmakers": 1,
+                    "raw_totals":   totals,
+                })
 
-
-# ── Prédiction du total d'un match ───────────────────────────────────────────
-
-def predict_match_total(home_team_name: str, away_team_name: str,
-                         league_df: pd.DataFrame | None = None) -> dict:
-    """
-    Prédit le total de points attendu pour un match (home vs away).
-
-    Méthode : moyenne pondérée entre :
-      - OFF_RATING domicile + DEF_RATING extérieur (stats de saison complète)
-      - Forme récente des deux équipes (n derniers matchs)
-
-    Retourne un dict avec le total prédit et les détails du calcul.
-    """
-    # Charger les stats de ligue si non fournies
-    if league_df is None:
-        league_df = get_league_advanced_stats()
-
-    # Récupérer les IDs
-    home_id = get_team_id(home_team_name)
-    away_id = get_team_id(away_team_name)
-
-    if not home_id or not away_id:
-        raise ValueError(f"Équipe introuvable : {home_team_name} ou {away_team_name}")
-
-    # Stats de saison des deux équipes
-    home_stats = league_df[league_df["TEAM_ID"] == home_id].iloc[0] if home_id in league_df["TEAM_ID"].values else None
-    away_stats = league_df[league_df["TEAM_ID"] == away_id].iloc[0] if away_id in league_df["TEAM_ID"].values else None
-
-    # Forme récente
-    print(f"[NBA] Forme récente : {home_team_name}...")
-    home_form = get_team_recent_form(home_id)
-    print(f"[NBA] Forme récente : {away_team_name}...")
-    away_form = get_team_recent_form(away_id)
-
-    # ── Calcul du total prédit ────────────────────────────────────────────────
-    # Méthode 1 : OFF_RATING + DEF_RATING (sur toute la saison, normalisé en points)
-    # OFF_RATING = points pour 100 possessions → on normalise avec le PACE
-    total_season = None
-    if home_stats is not None and away_stats is not None:
-        pace         = (home_stats.get("PACE", 98) + away_stats.get("PACE", 98)) / 2
-        home_off_pts = (home_stats.get("OFF_RATING", 110) / 100) * (pace / 2)
-        away_off_pts = (away_stats.get("OFF_RATING", 110) / 100) * (pace / 2)
-        home_def_pts = (home_stats.get("DEF_RATING", 110) / 100) * (pace / 2)
-        away_def_pts = (away_stats.get("DEF_RATING", 110) / 100) * (pace / 2)
-
-        home_pts_pred = (home_off_pts + away_def_pts) / 2
-        away_pts_pred = (away_off_pts + home_def_pts) / 2
-        total_season  = round(home_pts_pred + away_pts_pred, 1)
-
-    # Méthode 2 : forme récente brute
-    total_recent = None
-    if home_form and away_form:
-        total_recent = round(
-            (home_form["pts_for_avg"] + away_form["pts_for_avg"] +
-             home_form["pts_against_avg"] + away_form["pts_against_avg"]) / 2,
-            1
-        )
-
-    # Pondération finale : 60% saison, 40% forme récente
-    if total_season and total_recent:
-        predicted_total = round(0.6 * total_season + 0.4 * total_recent, 1)
-    elif total_season:
-        predicted_total = total_season
-    elif total_recent:
-        predicted_total = total_recent
-    else:
-        predicted_total = None
-
-    return {
-        "home_team":       home_team_name,
-        "away_team":       away_team_name,
-        "predicted_total": predicted_total,
-        "total_season":    total_season,
-        "total_recent":    total_recent,
-        "home_form":       home_form,
-        "away_form":       away_form,
-    }
+    print(f"[PS3838] {len(results)} matchs avec cotes totals")
+    return results
 
 
-# ── Test rapide ───────────────────────────────────────────────────────────────
+def get_nba_odds_parsed() -> list[dict]:
+    fixtures  = get_nba_fixtures()
+    if not fixtures:
+        return []
+    odds_data = get_nba_odds_raw()
+    if not odds_data:
+        return []
+    return parse_totals(fixtures, odds_data)
+
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("  NBA FETCHER — Test")
+    print("  PS3838 ODDS FETCHER — Test")
     print("=" * 55)
+    try:
+        balance = client.get_client_balance()
+        print(f"\n Connecté ! Solde : {balance.get('availableBalance', '?')} {balance.get('currency', '')}")
+    except Exception as e:
+        print(f"\n Erreur de connexion : {e}")
+        print("  Vérifie PS3838_USERNAME et PS3838_PASSWORD dans ton .env")
+        exit(1)
 
-    # Stats avancées de la ligue
-    df = get_league_advanced_stats()
-    print("\nTop 5 équipes par NET_RATING :")
-    print(df.nlargest(5, "NET_RATING")[["TEAM_NAME", "NET_RATING", "PACE", "OFF_RATING", "DEF_RATING"]].to_string(index=False))
-
-    # Prédiction d'un match exemple
-    print("\n" + "=" * 55)
-    result = predict_match_total("Boston Celtics", "Golden State Warriors", df)
-    print(f"\nMatch : {result['home_team']} vs {result['away_team']}")
-    print(f"  Total prédit (saison)  : {result['total_season']}")
-    print(f"  Total prédit (forme)   : {result['total_recent']}")
-    print(f"  Total prédit (final)   : {result['predicted_total']}")
-    print(f"  Forme Boston           : {result['home_form'].get('pts_for_avg')} pts/match (récent)")
-    print(f"  Forme Golden State     : {result['away_form'].get('pts_for_avg')} pts/match (récent)")
+    totals = get_nba_odds_parsed()
+    if not totals:
+        print("\nAucun match NBA disponible pour le moment.")
+    else:
+        print(f"\n{len(totals)} matchs disponibles :\n")
+        for m in totals[:5]:
+            print(f"  {m['date']} | {m['away_team']} @ {m['home_team']}")
+            print(f"    Ligne  : {m['total_line']} pts")
+            print(f"    Over   : {m['best_over']['price']}")
+            print(f"    Under  : {m['best_under']['price']}")
+            print()

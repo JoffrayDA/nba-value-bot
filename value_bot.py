@@ -19,7 +19,7 @@ from datetime import datetime
 from dataclasses import dataclass, asdict
 
 from nba_fetcher import get_league_advanced_stats, predict_match_total
-from odds_fetcher import get_nba_odds, parse_totals, odd_to_prob
+from odds_fetcher import get_nba_odds_parsed, odd_to_prob
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -28,7 +28,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","REMPLACE_PAR_TON_CHAT_ID")
 
 # Seuils de détection
 MIN_VALUE        = 0.04   # valeur minimum pour alerter (4%)
-MIN_BOOKMAKERS   = 5      # ignorer les matchs couverts par peu de bookies
+MIN_BOOKMAKERS   = 1      # ignorer les matchs couverts par peu de bookies
 KELLY_FRACTION   = 0.25   # Kelly fractionné (25% du Kelly pur = plus prudent)
 BANKROLL         = 1000   # Bankroll fictive en € pour calculer la mise Kelly
 
@@ -283,8 +283,8 @@ def main():
 
     # 2. Récupérer les cotes
     print("\n[2/3] Récupération des cotes...")
-    games  = get_nba_odds()
-    totals = parse_totals(games)
+    totals = get_nba_odds_parsed()
+
     print(f"  {len(totals)} matchs avec cotes totals")
 
     if not totals:

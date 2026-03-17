@@ -147,24 +147,28 @@ def predict_match_total(home_team_name: str, away_team_name: str,
     # OFF_RATING = points pour 100 possessions → on normalise avec le PACE
     total_season = None
     if home_stats is not None and away_stats is not None:
-        pace         = (home_stats.get("PACE", 98) + away_stats.get("PACE", 98)) / 2
-        home_off_pts = (home_stats.get("OFF_RATING", 110) / 100) * (pace / 2)
-        away_off_pts = (away_stats.get("OFF_RATING", 110) / 100) * (pace / 2)
-        home_def_pts = (home_stats.get("DEF_RATING", 110) / 100) * (pace / 2)
-        away_def_pts = (away_stats.get("DEF_RATING", 110) / 100) * (pace / 2)
+        # PACE = possessions par match (ex: 100)
+        # OFF_RATING = points marqués pour 100 possessions (ex: 119)
+        # Points marqués par équipe ≈ (OFF_RATING / 100) * PACE
+        pace          = (home_stats.get("PACE", 98) + away_stats.get("PACE", 98)) / 2
+        home_off_pts  = (home_stats.get("OFF_RATING", 110) / 100) * pace
+        away_off_pts  = (away_stats.get("OFF_RATING", 110) / 100) * pace
+        home_def_pts  = (home_stats.get("DEF_RATING", 110) / 100) * pace
+        away_def_pts  = (away_stats.get("DEF_RATING", 110) / 100) * pace
 
+        # Points attendus de chaque équipe = moyenne OFF de l'attaque et DEF de l'adversaire
         home_pts_pred = (home_off_pts + away_def_pts) / 2
         away_pts_pred = (away_off_pts + home_def_pts) / 2
         total_season  = round(home_pts_pred + away_pts_pred, 1)
 
     # Méthode 2 : forme récente brute
+    # pts_for + pts_against = total du match côté domicile
+    # on fait la moyenne avec le total côté extérieur
     total_recent = None
     if home_form and away_form:
-        total_recent = round(
-            (home_form["pts_for_avg"] + away_form["pts_for_avg"] +
-             home_form["pts_against_avg"] + away_form["pts_against_avg"]) / 2,
-            1
-        )
+        total_via_home = home_form["pts_for_avg"] + home_form["pts_against_avg"]
+        total_via_away = away_form["pts_for_avg"] + away_form["pts_against_avg"]
+        total_recent   = round((total_via_home + total_via_away) / 2, 1)
 
     # Pondération finale : 60% saison, 40% forme récente
     if total_season and total_recent:
